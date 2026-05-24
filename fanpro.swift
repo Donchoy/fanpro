@@ -23,6 +23,44 @@ import Darwin
 
 private let ESC = "\u{001B}["
 
+/// Precompiled ANSI escape sequence regular expression to avoid recompilation on each visibleLength() call.
+private let ansiEscapeRegex = try! NSRegularExpression(
+    pattern: "\u{001B}\\[[0-9;]*[a-zA-Z]", options: []
+)
+
+/// Calculates the visible width of a string in a terminal (ignoring ANSI escape codes).
+func visibleLength(_ s: String) -> Int {
+    let ns = s as NSString
+    let clean = ansiEscapeRegex.stringByReplacingMatches(
+        in: s, options: [], range: NSRange(location: 0, length: ns.length), withTemplate: ""
+    )
+    var width = 0
+    for scalar in clean.unicodeScalars {
+        let v = scalar.value
+        // Zero-width characters: variation selectors, ZWJ, skin tone modifiers, etc.
+        if v == 0xFE0F || v == 0xFE0E ||
+           (v >= 0x200B && v <= 0x200D) ||
+           (v >= 0xE0100 && v <= 0xE01EF) ||
+           (v >= 0x1F3FB && v <= 0x1F3FF) {
+            continue
+        }
+        // Double-width characters: Emoji, CJK Ideographs, and miscellaneous symbols.
+        if v >= 0x1F000 ||                          // Emoticons, Supplemental Symbols
+           (v >= 0x2600 && v <= 0x27BF) ||           // Misc Symbols + Dingbats (⚡⚠☕ etc.)
+           (v >= 0x2300 && v <= 0x23FF) ||           // Misc Technical (⏱⌚ etc.)
+           (v >= 0x2B50 && v <= 0x2B55) ||           // Stars, circles
+           (v >= 0x4E00 && v <= 0x9FFF) ||           // CJK Unified Ideographs
+           (v >= 0x3400 && v <= 0x4DBF) ||           // CJK Extension A
+           (v >= 0xF900 && v <= 0xFAFF) ||           // CJK Compatibility
+           (v >= 0x20000 && v <= 0x2FA1F) {          // CJK Extensions B-F
+            width += 2
+        } else {
+            width += 1
+        }
+    }
+    return width
+}
+
 enum ANSI {
     static let reset       = "\(ESC)0m"
     static let bold        = "\(ESC)1m"
@@ -87,7 +125,7 @@ func IOHIDServiceClientCopyProperty(_ service: AnyObject, _ key: CFString) -> An
 func IOHIDServiceClientCopyEvent(_ service: AnyObject,
                                   _ type: Int32,
                                   _ flags: UInt32,
-                                  _ options: UInt32) -> AnyObject?
+                                  _ options: UInt32) -> Unmanaged<AnyObject>?
 
 @_silgen_name("IOHIDEventGetFloatValue")
 func IOHIDEventGetFloatValue(_ event: AnyObject, _ field: UInt32) -> Double
@@ -199,8 +237,9 @@ final class SMCClient {
     private var conn: io_connect_t = 0
     private(set) var isOpen = false
 
-    /// Open a connection to AppleSMC.  Returns `false` on failure.
+    /// Opens a connection to AppleSMC. Returns `false` on failure.
     func open() -> Bool {
+        if isOpen { return true }
         let service = IOServiceGetMatchingService(
             0, // kIOMainPortDefault
             IOServiceMatching("AppleSMC")
@@ -216,6 +255,10 @@ final class SMCClient {
         guard isOpen else { return }
         IOServiceClose(conn)
         isOpen = false
+    }
+
+    deinit {
+        close()
     }
 
     // MARK: Raw driver call
@@ -357,10 +400,17 @@ struct ThermalSensor {
     let serviceRef: AnyObject          // IOHIDServiceClient opaque ref
     var temperature: Int = 0           // Rounded °C
 
+    /// Refreshes the temperature sensor by copying the latest HID thermal event.
     mutating func refresh() {
-        guard let ev = IOHIDServiceClientCopyEvent(
+        guard let unmanagedEvent = IOHIDServiceClientCopyEvent(
             serviceRef, kIOHIDEventTypeTemperature, 0, 0
         ) else { return }
+        
+        // Take ownership of the retained CoreFoundation object. Swift's ARC will
+        // automatically handle releasing it when 'ev' goes out of scope, 
+        // preventing a severe memory leak from this raw private C API.
+        let ev = unmanagedEvent.takeRetainedValue()
+        
         let raw = IOHIDEventGetFloatValue(ev, kIOHIDEventFieldBase)
         // Reject obviously invalid readings (disconnected/inactive sensors)
         if raw > -100.0 && raw < 200.0 {
@@ -373,10 +423,10 @@ struct FanInfo {
     let id: Int
     let name: String
     var currentRPM: Int = 0
-    var minRPM: Int = 0
-    var maxRPM: Int = 0
+    let minRPM: Int
+    let maxRPM: Int
 
-    /// Fan utilization 0.0 – 1.0.
+    /// Calculates fan utilization fraction between 0.0 and 1.0.
     var utilization: Double {
         guard maxRPM > minRPM else { return 0 }
         return min(max(Double(currentRPM - minRPM) / Double(maxRPM - minRPM), 0), 1)
@@ -512,7 +562,11 @@ final class TemperatureMonitor {
         return cpu.reduce(0) { $0 + $1.temperature } / cpu.count
     }
 
-    var maxTemp: Int { sensors.map(\.temperature).max() ?? 0 }
+    /// Peak temperature, clamped to [0, 120] to guard against anomalous sensor readings.
+    var maxTemp: Int {
+        let raw = sensors.map(\.temperature).max() ?? 0
+        return min(max(raw, 0), 120)
+    }
 
     // MARK: Helpers
 
@@ -562,47 +616,168 @@ final class TemperatureMonitor {
 // ============================================================================
 
 final class FanController {
+    enum CoolingMode: Equatable {
+        case auto
+        case manual(pct: Int)
+        case smart(currentPct: Int)
+    }
+
     private let smc: SMCClient
     private(set) var fans: [FanInfo] = []
-    private(set) var isManual = false
-    private(set) var manualPct: Int = 0
+    private(set) var mode: CoolingMode = .auto
 
+    /// Opaque counter to delay fan speed ramp-down (cooling) for noise and SMC lifespan optimization.
+    private var coolingDelayCounter: Int = 0
+
+    /// Helper attributes to maintain backwards compatibility with existing Dashboard code.
+    var isManual: Bool {
+        if case .manual = mode { return true }
+        return false
+    }
+    var manualPct: Int {
+        if case .manual(let pct) = mode { return pct }
+        return 0
+    }
+    var isSmart: Bool {
+        if case .smart = mode { return true }
+        return false
+    }
+    var smartPct: Int {
+        if case .smart(let pct) = mode { return pct }
+        return 0
+    }
+
+    /// Initializes the controller by fetching and caching static hardware properties of all fans.
     init(smc: SMCClient) {
         self.smc = smc
         let count = smc.fanCount()
         for i in 0..<count {
-            fans.append(FanInfo(id: i, name: smc.fanName(i)))
+            let id = i
+            let name = smc.fanName(i)
+            
+            // Query physical limits from AppleSMC once
+            var minR = smc.fanMinRPM(id)
+            var maxR = smc.fanMaxRPM(id)
+            
+            // Safety boundary validation: if reading returns zero or invalid limits, fall back to safe Apple defaults.
+            if maxR <= minR || maxR < 1000 {
+                minR = 1200
+                maxR = 6000
+            }
+            
+            fans.append(FanInfo(id: id, name: name, currentRPM: minR, minRPM: minR, maxRPM: maxR))
         }
     }
 
+    /// Refreshes dynamic status (current RPM only) to minimize SMC I/O latency.
     func refreshAll() {
         for i in fans.indices {
             fans[i].currentRPM = smc.fanActualRPM(fans[i].id)
-            fans[i].minRPM     = smc.fanMinRPM(fans[i].id)
-            fans[i].maxRPM     = smc.fanMaxRPM(fans[i].id)
         }
     }
 
-    /// Set all fans to a percentage (0-100).  Requires root.
+    /// Sets all fans to a specific target percentage (0-100). Requires root.
     func setPercentage(_ pct: Int) -> Bool {
         guard pct >= 0, pct <= 100 else { return false }
         var ok = true
         for fan in fans {
-            // Enable manual mode for this fan via F{id}md
             if !smc.setFanManualMode(fan.id, manual: true) { ok = false }
-            // Compute target RPM from percentage
-            let target = fan.minRPM + Int(Double(pct) / 100.0 * Double(fan.maxRPM - fan.minRPM))
+            
+            // Protect against zero division or illogical limits
+            let minR = fan.minRPM
+            let maxR = fan.maxRPM > fan.minRPM ? fan.maxRPM : fan.minRPM + 100
+            
+            let target = minR + Int(Double(pct) / 100.0 * Double(maxR - minR))
             if !smc.setFanTarget(fan.id, rpm: target) { ok = false }
         }
-        if ok { isManual = true; manualPct = pct }
+        if ok { mode = .manual(pct: pct) }
         return ok
     }
 
-    /// Restore all fans to automatic (system-managed) mode.
+    /// Restores all fans to automatic (system-managed) mode.
     func restoreAuto() -> Bool {
         let ok = smc.setAllFansAuto()
-        if ok { isManual = false; manualPct = 0 }
+        if ok { mode = .auto }
         return ok
+    }
+
+    /// Enables the smart cooling mode.
+    func enableSmartMode() -> Bool {
+        let ok = smc.setAllFansAuto()
+        if ok {
+            mode = .smart(currentPct: 0)
+            coolingDelayCounter = 0
+        }
+        return ok
+    }
+
+    /// Updates the smart cooling rules using a 5% step quantization and a constant 10-second hysteresis cooling delay.
+    func updateSmartCooling(peakTemp: Int, interval: Int) {
+        guard case .smart(let currentPct) = mode else { return }
+
+        // 1. Calculate raw target percentage based on standard Apple Silicon thermal profiles.
+        let rawTargetPct: Int
+        if peakTemp <= 55 {
+            // Quiet Zone: fully delegate to native macOS management
+            rawTargetPct = 0
+        } else if peakTemp <= 70 {
+            // Warm-up Defense Zone: 30% to 50% linear progression
+            let ratio = Double(peakTemp - 55) / 15.0
+            rawTargetPct = 30 + Int(ratio * 20.0)
+        } else if peakTemp <= 85 {
+            // Active Performance Zone: 50% to 90% linear progression
+            let ratio = Double(peakTemp - 70) / 15.0
+            rawTargetPct = 50 + Int(ratio * 40.0)
+        } else {
+            // Thermal Wall Prevention Zone: max blast at 100%
+            rawTargetPct = 100
+        }
+
+        // 2. Quantize target percentage to 5% steps to prevent fine-grained fluctuations.
+        let targetPct: Int
+        if rawTargetPct == 0 {
+            targetPct = 0
+        } else {
+            targetPct = min(100, ((rawTargetPct + 4) / 5) * 5)
+        }
+
+        // 3. Process changes with speed-up urgency and cooling delay protection.
+        if targetPct > currentPct {
+            // TEMPERATURE RISING: React immediately to suppress heating and avoid thermal throttling.
+            applySmartTarget(targetPct)
+            coolingDelayCounter = 0
+        } else if targetPct < currentPct {
+            // TEMPERATURE FALLING: Apply a constant 10-second delay to debounce fan speed ramp-down.
+            coolingDelayCounter += 1
+            
+            // Calculate how many cycles represent a 10-second period.
+            // Using ceiling division to guarantee at least 10 seconds of delay.
+            let requiredCycles = max(1, (10 + interval - 1) / (interval > 0 ? interval : 1))
+            
+            if coolingDelayCounter >= requiredCycles {
+                applySmartTarget(targetPct)
+                coolingDelayCounter = 0
+            }
+        } else {
+            // Temperature is stable at this step range: reset cooling delay counter.
+            coolingDelayCounter = 0
+        }
+    }
+
+    /// Internal helper to write manual speed overrides or restore auto control under smart mode.
+    private func applySmartTarget(_ pct: Int) {
+        if pct == 0 {
+            _ = smc.setAllFansAuto()
+        } else {
+            for fan in fans {
+                _ = smc.setFanManualMode(fan.id, manual: true)
+                let minR = fan.minRPM
+                let maxR = fan.maxRPM > fan.minRPM ? fan.maxRPM : fan.minRPM + 100
+                let targetRPM = minR + Int(Double(pct) / 100.0 * Double(maxR - minR))
+                _ = smc.setFanTarget(fan.id, rpm: targetRPM)
+            }
+        }
+        mode = .smart(currentPct: pct)
     }
 }
 
@@ -625,13 +800,13 @@ func enableRawMode() {
     }
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
 
-    // 进入终端备用屏幕缓冲区 (Alternate Screen Buffer)，并进行一次清空与隐藏光标
+    // Enter alternate screen buffer, clear screen, and hide cursor
     print("\(ESC)?1049h\(ESC)2J\(ESC)H\(ESC)?25l", terminator: "")
     fflush(stdout)
 }
 
 func disableRawMode() {
-    // 退出终端备用屏幕缓冲区，并还原光标显示
+    // Exit alternate screen buffer and restore cursor visibility
     print("\(ESC)?1049l\(ESC)?25h", terminator: "")
     fflush(stdout)
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &savedTermios)
@@ -645,8 +820,8 @@ func readLineRaw(prompt: String) -> String? {
     var buf = ""
     while true {
         var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-        let pr = poll(&pfd, 1, -1) // 无限期阻塞等待键盘输入
-        guard pr > 0, (pfd.revents & Int16(POLLIN)) != 0 else { continue }
+        let pr = poll(&pfd, 1, 30_000) // 30-second timeout to prevent Smart mode thermal logic from blocking indefinitely
+        guard pr > 0, (pfd.revents & Int16(POLLIN)) != 0 else { return nil }
 
         var c: UInt8 = 0
         guard read(STDIN_FILENO, &c, 1) == 1 else { return nil }
@@ -698,10 +873,10 @@ final class Dashboard {
     let temps: TemperatureMonitor
     let fans:  FanController
     let isRoot: Bool
-    var interval: Double = 3.0
+    var interval: Int = 3
 
-    private let W = 70                        // 外框宽度
-    private let maxTempForBar: Double = 105   // 100% 对应的温度值
+    private let W = 70                        // Outer frame border width
+    private let maxTempForBar: Double = 105   // Temperature corresponding to 100% bar
 
     init(temps: TemperatureMonitor, fans: FanController) {
         self.temps  = temps
@@ -709,37 +884,48 @@ final class Dashboard {
         self.isRoot = (getuid() == 0)
     }
 
-    /// 获取终端实际可见行数
+    /// Fetches the actual number of visible terminal rows with a safe minimum bound.
     private func getTerminalRows() -> Int {
         var w = WinSize(row: 0, col: 0, xpixel: 0, ypixel: 0)
         let TIOCGWINSZ = UInt(0x40087468)
         if ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 {
-            return Int(w.row)
+            return max(15, Int(w.row))
         }
-        return 24 // 默认 fallback
+        return 24 // Fallback default
     }
 
+    /// Places the right border ║ firmly at column W using ANSI cursor positioning (CSI n G),
+    /// completely preventing right-border offset errors caused by emoji/unicode width mismatches.
     private func boxLine(_ text: String, style: String) -> String {
-        "\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)\(style)\(text)\(ANSI.reset)"
+        return "\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)\(style)\(text)\(ANSI.reset)\(ESC)K\(ESC)\(W)G\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)"
     }
 
     private func boxLineRaw(_ text: String) -> String {
-        "\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)\(text)"
+        return "\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)\(text)\(ANSI.reset)\(ESC)K\(ESC)\(W)G\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)"
     }
 
     private func emptyBoxLine() -> String {
-        "\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)"
+        return "\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)\(ESC)K\(ESC)\(W)G\(ANSI.cyan)\(ANSI.bold)║\(ANSI.reset)"
     }
 
-    private func fmtInterval(_ s: Double) -> String {
-        s < 1.0 ? String(format: "%.0fms", s * 1000) : String(format: "%.1fs", s)
+    /// Formats the refresh interval into a standard string representation.
+    private func fmtInterval(_ s: Int) -> String {
+        return "\(s)s"
     }
 
-    /// 将传感器数组渲染为多列网格
+    /// Renders the sensor array into a multi-column grid centered horizontally within the inner width.
     private func renderSensorGrid(_ sensors: [ThermalSensor], cols: Int, innerWidth: Int) -> [String] {
         var result: [String] = []
         let count = sensors.count
         guard count > 0 else { return [] }
+
+        let targetColW = 28 // Fixed column display width
+        let joint = " \(ANSI.darkGray)│\(ANSI.reset) "
+        
+        // Calculate the total visible width of this row combined (e.g. 2 cols: 28 + 3 + 28 = 59)
+        let totalVisibleW = cols * targetColW + (cols - 1) * 3
+        let leftPadLen = max(0, (innerWidth - totalVisibleW) / 2)
+        let leftPad = String(repeating: " ", count: leftPadLen)
 
         let rowCount = Int(ceil(Double(count) / Double(cols)))
         for r in 0..<rowCount {
@@ -753,33 +939,28 @@ final class Dashboard {
                     let frac = Double(t) / maxTempForBar
                     let b = bar(fraction: frac, width: 8, color: col)
 
-                    // 压缩显示名称
+                    // Compress sensor names to fit nicely
                     var name = s.displayName
                     name = name.replacingOccurrences(of: "Performance Core", with: "P-Core")
                     name = name.replacingOccurrences(of: "Super Core", with: "S-Core")
                     name = name.replacingOccurrences(of: "Efficiency Core", with: "E-Core")
                     name = name.replacingOccurrences(of: "GPU Region", with: "GPU")
 
-                    // 格式化这一列的宽度
-                    let targetColW = (innerWidth - (cols - 1) * 3) / cols
-
                     let namePad = name.padding(toLength: 10, withPad: " ", startingAt: 0)
                     let tempStr = "\(col)\(ANSI.bold)\(String(format: "%3d", t))°C\(ANSI.reset)"
-                    let colText = " \(namePad) \(tempStr) \(b)"
+                    let colText = "\(namePad) \(tempStr) \(b)" // Visible length: 10 + 1 + 5 + 1 + 8 = 25
 
-                    // 计算纯文本可见宽度用于填充
-                    let visibleLen = 27
+                    let visibleLen = 25
                     let padLen = max(0, targetColW - visibleLen)
                     let padding = String(repeating: " ", count: padLen)
 
                     rowParts.append(colText + padding)
                 } else {
-                    let targetColW = (innerWidth - (cols - 1) * 3) / cols
                     rowParts.append(String(repeating: " ", count: targetColW))
                 }
             }
-            let joint = " \(ANSI.darkGray)│\(ANSI.reset) "
-            result.append(boxLineRaw("   " + rowParts.joined(separator: joint)))
+            // Apply horizontal centering padding to each row of the grid
+            result.append(boxLineRaw(leftPad + rowParts.joined(separator: joint)))
         }
         return result
     }
@@ -788,24 +969,24 @@ final class Dashboard {
         var lines: [String] = []
 
         let hLine = String(repeating: "═", count: W - 2)
-        let tLine = String(repeating: "─", count: W - 6)
+        let tLine = String(repeating: "─", count: W - 8)
 
         // 1. Header
         lines.append("\(ANSI.cyan)\(ANSI.bold)╔\(hLine)╗\(ANSI.reset)")
         
-        // 居中排版主标题 (⚡ 占 2 单元格但 count 算 1)
+        // Center the main title - use visibleLength to precisely calculate width containing emoji
         let titleText = "⚡  F A N P R O  ·  Apple Silicon Thermal Command Center"
-        let titleLen = titleText.count + 1
-        let titlePad = max(0, (W - 2 - titleLen) / 2)
+        let titleVisLen = visibleLength(titleText)
+        let titlePad = max(0, (W - 2 - titleVisLen) / 2)
         let titleLeftPad = String(repeating: " ", count: titlePad)
         lines.append(boxLine(titleLeftPad + titleText, style: "\(ANSI.bold)\(ANSI.white)"))
         
-        // 居中排版紧凑的副标题 (仅保留闹钟 ⏱ 图标，动态加载设备信息)
+        // Center the subtitle - use visibleLength to precisely calculate width
         let subText = "\(temps.chipName) · \(temps.osVersionString) · ⏱ \(fmtInterval(interval))"
-        let visibleLen = subText.count + 1 // ⏱ 占 2 单元格但 count 算 1
-        let padLen = max(0, (W - 2 - visibleLen) / 2)
-        let leftPad = String(repeating: " ", count: padLen)
-        lines.append(boxLine(leftPad + subText, style: ANSI.gray))
+        let subVisLen = visibleLength(subText)
+        let subPadLen = max(0, (W - 2 - subVisLen) / 2)
+        let subLeftPad = String(repeating: " ", count: subPadLen)
+        lines.append(boxLine(subLeftPad + subText, style: ANSI.gray))
         
         lines.append("\(ANSI.cyan)\(ANSI.bold)╠\(hLine)╣\(ANSI.reset)")
 
@@ -820,7 +1001,7 @@ final class Dashboard {
             lines.append(boxLineRaw(header))
             lines.append(boxLine("    \(tLine)", style: ANSI.darkGray))
 
-            let innerW = W - 6
+            let innerW = W - 2
             let gridLines = renderSensorGrid(list, cols: 2, innerWidth: innerW)
             lines.append(contentsOf: gridLines)
             lines.append(emptyBoxLine())
@@ -833,63 +1014,102 @@ final class Dashboard {
 
         // 3. Fan Section
         lines.append("\(ANSI.cyan)\(ANSI.bold)╠\(hLine)╣\(ANSI.reset)")
-        let modeStr = fans.isManual ? "\(ANSI.yellow)\(ANSI.bold)Manual (\(fans.manualPct)%)\(ANSI.reset)" : "\(ANSI.green)\(ANSI.bold)Auto\(ANSI.reset)"
-        lines.append(boxLineRaw("  🌀  \(ANSI.bold)\(ANSI.white)Fans\(ANSI.reset)                                          Mode: \(modeStr)"))
+        lines.append(boxLineRaw("  🌀  \(ANSI.bold)\(ANSI.white)Fans\(ANSI.reset)"))
         lines.append(boxLine("    \(tLine)", style: ANSI.darkGray))
 
         if fans.fans.isEmpty {
             lines.append(boxLine("    No fans detected (MacBook Air / passive cooling).", style: ANSI.gray))
         } else {
+            // Keep fan layout aligned with temperature grid (59 visible chars)
+            // name(10) + 1 + RPM(8) + 2 + bar(16) + 1 + pct(4) + 2 + range(15) = 59
+            let fanContentW = 59
+            let fanPadLen = max(0, (W - 2 - fanContentW) / 2)
+            let fanLeftPad = String(repeating: " ", count: fanPadLen)
+
             for f in fans.fans {
                 let name = f.name.padding(toLength: 10, withPad: " ", startingAt: 0)
                 let col  = ANSI.colorForFan(f.utilization)
-                let b    = bar(fraction: f.utilization, width: 12, color: col)
+                let b    = bar(fraction: f.utilization, width: 16, color: col)
                 let pct  = Int(f.utilization * 100)
 
-                let fanText = "   \(ANSI.white)\(name)\(ANSI.reset) "
+                let rawFanText = "\(name) "
                     + "\(col)\(ANSI.bold)\(String(format: "%4d", f.currentRPM)) RPM\(ANSI.reset)  "
                     + "\(b) \(ANSI.gray)\(String(format: "%3d%%", pct))\(ANSI.reset)  "
-                    + "\(ANSI.darkGray)(\(f.minRPM)-\(f.maxRPM) RPM)\(ANSI.reset)"
+                    + "\(ANSI.darkGray)\(String(format: "(%4d-%4d RPM)", f.minRPM, f.maxRPM))\(ANSI.reset)"
 
-                lines.append(boxLineRaw(fanText))
+                lines.append(boxLineRaw(fanLeftPad + rawFanText))
             }
         }
         lines.append(emptyBoxLine())
 
         // 4. Status Bar
         lines.append("\(ANSI.cyan)\(ANSI.bold)╠\(hLine)╣\(ANSI.reset)")
+        
+        let modeDisplay: String
+        if fans.isSmart {
+            if fans.smartPct == 0 {
+                modeDisplay = "Mode: Smart (Auto)"
+            } else {
+                modeDisplay = "Mode: Smart (\(fans.smartPct)%)"
+            }
+        } else if fans.isManual {
+            modeDisplay = "Mode: Manual (\(fans.manualPct)%)"
+        } else {
+            modeDisplay = "Mode: Auto"
+        }
+        
         let cpu = temps.cpuAverage
         let mx  = temps.maxTemp
-        lines.append(boxLineRaw(
-            "  \(ANSI.gray)CPU Avg: \(ANSI.colorForTemp(cpu))\(ANSI.bold)\(cpu)°C\(ANSI.reset)"
-          + "  \(ANSI.gray)│  Peak: \(ANSI.colorForTemp(mx))\(ANSI.bold)\(mx)°C\(ANSI.reset)"
-          + "  \(ANSI.gray)│  \(isRoot ? "🔓 Root" : "🔒 Read-only")\(ANSI.reset)"
-        ))
+        
+        let authText = isRoot ? "🔓 Root" : "🔒 Read-only"
+        
+        // Add status bar spacing with wide separator "  │  " (5 visible chars)
+        let wideSep = "  │  "
+        let plainStatus = modeDisplay + wideSep + "CPU Avg: \(cpu)°C" + wideSep + "Peak: \(mx)°C" + wideSep + authText
+        let plainVisLen = visibleLength(plainStatus)
+        
+        let statusPad = max(0, (W - 2 - plainVisLen) / 2)
+        let statusLeftPad = String(repeating: " ", count: statusPad)
+        
+        let coloredMode = "\(ANSI.yellow)\(ANSI.bold)\(modeDisplay)\(ANSI.reset)"
+        let coloredCpu = "\(ANSI.gray)CPU Avg: \(ANSI.colorForTemp(cpu))\(ANSI.bold)\(cpu)°C\(ANSI.reset)"
+        let coloredPeak = "\(ANSI.gray)Peak: \(ANSI.colorForTemp(mx))\(ANSI.bold)\(mx)°C\(ANSI.reset)"
+        let coloredAuth = "\(ANSI.gray)\(authText)\(ANSI.reset)"
+        let coloredSep = "\(ANSI.darkGray)  │  \(ANSI.reset)"
+        
+        let statusText = statusLeftPad + coloredMode + coloredSep + coloredCpu + coloredSep + coloredPeak + coloredSep + coloredAuth
+        
+        lines.append(boxLineRaw(statusText))
 
         // 5. Hotkeys Footer
         lines.append("\(ANSI.cyan)\(ANSI.bold)╠\(hLine)╣\(ANSI.reset)")
+        
+        let footerText: String
         if isRoot {
-            lines.append(boxLineRaw(
-                "  \(ANSI.bold)\(ANSI.cyan)[I]\(ANSI.reset)\(ANSI.white) Interval  "
-              + "\(ANSI.bold)\(ANSI.cyan)[F]\(ANSI.reset)\(ANSI.white) Fan Speed  "
-              + "\(ANSI.bold)\(ANSI.cyan)[A]\(ANSI.reset)\(ANSI.white) Auto Mode  "
-              + "\(ANSI.bold)\(ANSI.red)[Q]\(ANSI.reset)\(ANSI.white) Quit\(ANSI.reset)"
-            ))
+            footerText = "\(ANSI.bold)\(ANSI.cyan)[A]\(ANSI.reset)\(ANSI.white) Auto Mode "
+                       + "\(ANSI.bold)\(ANSI.cyan)[S]\(ANSI.reset)\(ANSI.white) Smart Mode "
+                       + "\(ANSI.bold)\(ANSI.cyan)[F]\(ANSI.reset)\(ANSI.white) Fan Speed "
+                       + "\(ANSI.bold)\(ANSI.cyan)[I]\(ANSI.reset)\(ANSI.white) Interval "
+                       + "\(ANSI.bold)\(ANSI.red)[Q]\(ANSI.reset)\(ANSI.white) Quit\(ANSI.reset)"
         } else {
-            lines.append(boxLineRaw(
-                "  \(ANSI.bold)\(ANSI.cyan)[I]\(ANSI.reset)\(ANSI.white) Interval  "
-              + "\(ANSI.darkGray)[F] sudo  "
-              + "[A] sudo  \(ANSI.reset)"
-              + "\(ANSI.bold)\(ANSI.red)[Q]\(ANSI.reset)\(ANSI.white) Quit\(ANSI.reset)"
-            ))
+            footerText = "\(ANSI.darkGray)[A] sudo "
+                       + "[S] sudo "
+                       + "[F] sudo \(ANSI.reset)"
+                       + "\(ANSI.bold)\(ANSI.cyan)[I]\(ANSI.reset)\(ANSI.white) Interval "
+                       + "\(ANSI.bold)\(ANSI.red)[Q]\(ANSI.reset)\(ANSI.white) Quit\(ANSI.reset)"
         }
+        
+        let footerVisLen = visibleLength(footerText)
+        let footerPad = max(0, (W - 2 - footerVisLen) / 2)
+        let footerLeftPad = String(repeating: " ", count: footerPad)
+        lines.append(boxLineRaw(footerLeftPad + footerText))
         lines.append("\(ANSI.cyan)\(ANSI.bold)╚\(hLine)╝\(ANSI.reset)")
 
-        // 6. 防超出可见高度裁剪逻辑 (和 top 一致)
+        // 6. Prevent screen overflow by folding contents (consistent with top layout)
         let maxRows = getTerminalRows()
         if lines.count > maxRows {
-            let reservedFooterCount = 3 // 底部边框 + 热键行 + 装饰线
-            let headerCount = 4 // 顶部边框 + 标题 + 副标题 + 装饰线
+            let reservedFooterCount = 3 // bottom border + hotkeys + divider
+            let headerCount = 4 // top border + title + subtitle + divider
             
             if maxRows > (headerCount + reservedFooterCount + 2) {
                 let keepBodyCount = maxRows - headerCount - reservedFooterCount - 1
@@ -898,15 +1118,15 @@ final class Dashboard {
                 let footerPart = lines.suffix(reservedFooterCount)
                 
                 lines = Array(headerPart) + Array(bodyPart)
-                lines.append(boxLineRaw("  \(ANSI.red)⚠️ 终端窗口高度不足，部分传感器已折叠... (请拉大窗口)\(ANSI.reset)"))
+                lines.append(boxLineRaw("  \(ANSI.red)⚠️ Terminal height insufficient, some sensors collapsed... (Please resize window)\(ANSI.reset)"))
                 lines += Array(footerPart)
             } else {
-                // 窗口实在过小时直接粗暴截断
+                // Truncate fallback if window is extremely small
                 lines = Array(lines.prefix(maxRows))
             }
         }
 
-        // 7. 输出到屏幕：就地覆盖渲染，行尾清除残留，末尾绝不打换行符，防终端自动向下滚动
+        // 7. Output to screen: render in-place, clear line ends, and avoid newlines at the end to prevent automatic scrolling
         let out = ANSI.home + ANSI.hideCursor + lines.joined(separator: "\(ANSI.clearLineEnd)\n") + ANSI.clearLineEnd + ANSI.clearEnd
         print(out, terminator: "")
         fflush(stdout)
@@ -920,13 +1140,16 @@ final class Dashboard {
 private var gSMC: SMCClient?
 private var gFans: FanController?
 
+/// Restores fans to auto, disables raw mode, and safely shuts down SMC.
 func cleanExit(_ code: Int32 = 0) -> Never {
     _ = gFans?.restoreAuto()
     disableRawMode()
-    // 还原控制台原本的颜色状态
+    // Reset console colors to default
     print(ANSI.reset, terminator: "")
     if code == 0 {
-        print("\n\(ANSI.green)\(ANSI.bold)FanPro:\(ANSI.reset) 已退出，风扇已恢复自动模式。✅")
+        print("\n\(ANSI.green)\(ANSI.bold)FanPro:\(ANSI.reset) Exited, fans restored to system default automatic mode. ✅")
+    } else {
+        print("\n\(ANSI.red)\(ANSI.bold)FanPro:\(ANSI.reset) Terminated abnormally (exit code \(code)). Restored terminal and fans. ⚠️")
     }
     fflush(stdout)
     gSMC?.close()
@@ -941,7 +1164,7 @@ func cleanExit(_ code: Int32 = 0) -> Never {
 assert(MemoryLayout<SMCParamStruct>.stride == 80,
        "SMCParamStruct stride is \(MemoryLayout<SMCParamStruct>.stride), expected 80")
 
-// 如果不是 root 用户，尝试用 sudo 重新执行自身进行进程自拉起，以自动获取 root 风扇控制权限
+// If not running as root, attempt to re-execute itself with sudo to acquire root permissions for fan control
 if getuid() != 0 && !CommandLine.arguments.contains("--readonly") {
     if let absoluteExePath = Bundle.main.executablePath {
         let argv = CommandLine.arguments
@@ -953,25 +1176,34 @@ if getuid() != 0 && !CommandLine.arguments.contains("--readonly") {
         let cArgs = newArgs.map { $0.withCString(strdup) }
         var argsForExec = cArgs + [nil]
         
-        // 使用 execvp 执行 sudo 重新拉起当前程序，替换当前进程
+        // Flush stdout and stderr buffers before executing process substitution
+        fflush(stdout)
+        fflush(stderr)
+        
+        // Use execvp to run sudo and relaunch the current executable, replacing this process
         execvp("sudo", &argsForExec)
         
-        // 如果密码输入被取消或者 sudo 执行失败，则释放内存并降级为普通只读模式继续运行
+        // If password entry is canceled or sudo fails, free allocated memory and fall back to standard read-only mode
         for arg in cArgs { free(arg) }
     }
 }
 
-// 1. Signal handlers for clean exit on Ctrl-C / kill
-signal(SIGINT)  { _ in cleanExit() }
-signal(SIGTERM) { _ in cleanExit() }
+// 1. Signal handlers for clean exit on Ctrl-C / kill / crashes
+signal(SIGINT)  { _ in cleanExit(0) }
+signal(SIGTERM) { _ in cleanExit(0) }
+signal(SIGSEGV) { _ in cleanExit(11) }
+signal(SIGBUS)  { _ in cleanExit(10) }
+signal(SIGILL)  { _ in cleanExit(4) }
+signal(SIGFPE)  { _ in cleanExit(8) }
+signal(SIGABRT) { _ in cleanExit(6) }
 
 // 2. Open SMC
 let smc = SMCClient()
 gSMC = smc
 guard smc.open() else {
     fputs("""
-    \(ANSI.red)\(ANSI.bold)错误:\(ANSI.reset) 无法连接 AppleSMC 驱动。
-    请确认此 Mac 使用 Apple Silicon 芯片，并且系统版本受支持。\n
+    \(ANSI.red)\(ANSI.bold)Error:\(ANSI.reset) Failed to connect to AppleSMC driver.
+    Please confirm this Mac uses an Apple Silicon chip and the macOS version is supported.\n
     """, stderr)
     exit(1)
 }
@@ -986,8 +1218,8 @@ let dash = Dashboard(temps: tempMon, fans: fanCtrl)
 // 4. Print launch banner (will be replaced by TUI on first render)
 if getuid() != 0 {
     fputs("""
-    \(ANSI.yellow)\(ANSI.bold)提示:\(ANSI.reset) 以普通用户运行，风扇控制不可用。
-    如需手动控制风扇，请使用 \(ANSI.bold)sudo ./mac-thermal.swift\(ANSI.reset) 运行。\n
+    \(ANSI.yellow)\(ANSI.bold)Note:\(ANSI.reset) Running as a standard user; fan control is unavailable.
+    To control fans, please run with sudo (e.g., sudo fanpro).\n
     """, stderr)
     Thread.sleep(forTimeInterval: 1.2)
 }
@@ -998,11 +1230,16 @@ enableRawMode()
 // 6. Main run loop
 var running = true
 while running {
-    // Refresh hardware data
+    // Refresh hardware data - dynamic currentRPM must be loaded. Static limits are already cached during initialization.
     tempMon.refreshAll()
     fanCtrl.refreshAll()
 
-    // Draw
+    // If in Smart cooling mode, dynamically adjust fan speed based on peak temperature
+    if fanCtrl.isSmart {
+        fanCtrl.updateSmartCooling(peakTemp: tempMon.maxTemp, interval: dash.interval)
+    }
+
+    // Draw TUI
     dash.render()
 
     // Wait for input or timeout
@@ -1025,9 +1262,9 @@ while running {
     case "i", "I":
         if let s = readLineRaw(prompt:
             "\(ANSI.clearScreen)\(ANSI.cyan)\(ANSI.bold)"
-          + "输入新的刷新间隔（秒，0.1 – 10.0）: \(ANSI.reset)")
+          + "Enter new refresh interval (seconds, 1 - 10): \(ANSI.reset)")
         {
-            if let v = Double(s), v >= 0.1, v <= 10.0 {
+            if let v = Int(s), v >= 1, v <= 10 {
                 dash.interval = v
             }
         }
@@ -1035,34 +1272,48 @@ while running {
     // ── Set fan speed ────────────────────────────────────────────
     case "f", "F":
         guard getuid() == 0 else {
-            print("\(ANSI.clearScreen)\(ANSI.yellow)需要 sudo 权限来控制风扇。\(ANSI.reset)")
+            print("\(ANSI.clearScreen)\(ANSI.yellow)Sudo privileges required to control fans.\(ANSI.reset)")
             fflush(stdout)
             Thread.sleep(forTimeInterval: 1.2)
             continue
         }
         if let s = readLineRaw(prompt:
             "\(ANSI.clearScreen)\(ANSI.cyan)\(ANSI.bold)"
-          + "输入目标风扇转速百分比（0 – 100）: \(ANSI.reset)")
+          + "Enter target fan speed percentage (0 - 100): \(ANSI.reset)")
         {
             if let pct = Int(s), pct >= 0, pct <= 100 {
                 if !fanCtrl.setPercentage(pct) {
-                    print("\(ANSI.red)写入风扇目标转速失败。\(ANSI.reset)")
+                    print("\(ANSI.red)Failed to set fan target speed.\(ANSI.reset)")
                     fflush(stdout)
                     Thread.sleep(forTimeInterval: 1.0)
                 }
             }
         }
 
+    // ── Enable smart cooling mode ────────────────────────────────
+    case "s", "S":
+        guard getuid() == 0 else {
+            print("\(ANSI.clearScreen)\(ANSI.yellow)Sudo privileges required to enable Smart mode.\(ANSI.reset)")
+            fflush(stdout)
+            Thread.sleep(forTimeInterval: 1.2)
+            continue
+        }
+        if !fanCtrl.enableSmartMode() {
+            print("\(ANSI.red)Failed to enable Smart mode.\(ANSI.reset)")
+            fflush(stdout)
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+
     // ── Restore auto mode ────────────────────────────────────────
     case "a", "A":
         guard getuid() == 0 else {
-            print("\(ANSI.clearScreen)\(ANSI.yellow)需要 sudo 权限来恢复自动模式。\(ANSI.reset)")
+            print("\(ANSI.clearScreen)\(ANSI.yellow)Sudo privileges required to restore Auto mode.\(ANSI.reset)")
             fflush(stdout)
             Thread.sleep(forTimeInterval: 1.2)
             continue
         }
         if !fanCtrl.restoreAuto() {
-            print("\(ANSI.red)恢复自动模式失败。\(ANSI.reset)")
+            print("\(ANSI.red)Failed to restore Auto mode.\(ANSI.reset)")
             fflush(stdout)
             Thread.sleep(forTimeInterval: 1.0)
         }
